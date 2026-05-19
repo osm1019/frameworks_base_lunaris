@@ -42,11 +42,11 @@ import java.util.concurrent.Executor;
 /**
  * This service is used to disable 5G for a subscription in the following scenarios:
  * - Battery saver mode is ON
- * - Mobile data is not active, eg. while using wifi
  * - Mobile data is not turned ON for the subscription
  * - Subscription is not the default data SIM
  *
- * Not smart enough yet, but we're getting there.
+ * WiFi connectivity does NOT disable 5G — NR SA bearers and VoNR calls
+ * must be preserved while on WiFi.
  */
 public class Smart5gService extends SystemService {
 
@@ -64,7 +64,6 @@ public class Smart5gService extends SystemService {
     private PowerManager mPowerManager;
 
     private boolean mIsEnabled;
-    private boolean mIsOnMobileData;
     private boolean mIsPowerSaveMode;
     private int[] mActiveSubIds = new int[0];
     private int mDefaultDataSubId = INVALID_SUBSCRIPTION_ID;
@@ -121,34 +120,6 @@ public class Smart5gService extends SystemService {
         }
     };
 
-    private final ConnectivityManager.NetworkCallback mDefaultNetworkCallback =
-            new ConnectivityManager.NetworkCallback() {
-        Network mDefaultNetwork = null;
-
-        @Override
-        public void onAvailable(Network network) {
-            dlog("NetworkCallback: onAvailable: " + network);
-            mDefaultNetwork = network;
-            refresh();
-        }
-
-        @Override
-        public void onLost(Network network) {
-            dlog("NetworkCallback: onLost: " + network);
-            mDefaultNetwork = null;
-            refresh();
-        }
-
-        private void refresh() {
-            boolean isMobileDataActive = isMobileDataNetwork(mDefaultNetwork);
-            if (isMobileDataActive != mIsOnMobileData) {
-                dlog("NetworkCallback: isMobileDataActive:" + isMobileDataActive);
-                mIsOnMobileData = isMobileDataActive;
-                update();
-            }
-        }
-    };
-
     private final SubscriptionManager.OnSubscriptionsChangedListener mSubListener =
             new SubscriptionManager.OnSubscriptionsChangedListener() {
         @Override
@@ -194,7 +165,6 @@ public class Smart5gService extends SystemService {
             mIsEnabled = isEnabled();
             mIsPowerSaveMode = mPowerManager.isPowerSaveMode();
             mDefaultDataSubId = mSubManager.getDefaultDataSubscriptionId();
-            mIsOnMobileData = isMobileDataNetwork(mConnectivityManager.getActiveNetwork());
             mContext.getContentResolver().registerContentObserver(
                     Settings.System.getUriFor(SMART_5G), false, mSettingObserver);
             if (mIsEnabled) {
@@ -204,31 +174,19 @@ public class Smart5gService extends SystemService {
     }
 
     private boolean isEnabled() {
-        return Settings.System.getIntForUser(mContext.getContentResolver(), SMART_5G, 1,
+        return Settings.System.getIntForUser(mContext.getContentResolver(), SMART_5G, 0,
                 UserHandle.USER_CURRENT) == 1;
-    }
-
-    private boolean isMobileDataNetwork(Network network) {
-        // if we cant get a default network, assume mobile data to stop further switching 4g/5g.
-        // otherwise, since switching can bring down the modem for a brief moment, this triggers
-        // onLost() in the network callback and network=null which will again trigger a switch,
-        // starting an infinite loop.
-        if (network == null) return true;
-        final NetworkCapabilities caps = mConnectivityManager.getNetworkCapabilities(network);
-        return caps == null || caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR);
     }
 
     private void registerListeners() {
         final IntentFilter filter = new IntentFilter(ACTION_POWER_SAVE_MODE_CHANGED);
         filter.addAction(ACTION_DEFAULT_DATA_SUBSCRIPTION_CHANGED);
         mContext.registerReceiver(mIntentReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
-        mConnectivityManager.registerDefaultNetworkCallback(mDefaultNetworkCallback);
         mSubManager.addOnSubscriptionsChangedListener(mExecutor, mSubListener);
     }
 
     private void unregisterListeners() {
         mContext.unregisterReceiver(mIntentReceiver);
-        mConnectivityManager.unregisterNetworkCallback(mDefaultNetworkCallback);
         mSubManager.removeOnSubscriptionsChangedListener(mSubListener);
     }
 
@@ -271,16 +229,14 @@ public class Smart5gService extends SystemService {
             dlog("shouldDisable5g: smart 5g is disabled");
             return false;
         }
-
         boolean isDataDisabled = !isMobileDataEnabled(subId);
         boolean isNotDataSub =
                 (mDefaultDataSubId != INVALID_SUBSCRIPTION_ID && subId != mDefaultDataSubId);
-
         dlog("shouldDisable5g: subId=" + subId + " mIsPowerSaveMode=" + mIsPowerSaveMode
-                + " mIsOnMobileData=" + mIsOnMobileData + " mDefaultDataSubId="
-                + mDefaultDataSubId + " isDataDisabled=" + isDataDisabled);
-
-        return mIsPowerSaveMode || !mIsOnMobileData || isDataDisabled || isNotDataSub;
+                + " mDefaultDataSubId=" + mDefaultDataSubId
+                + " isDataDisabled=" + isDataDisabled);
+        // Removed !mIsOnMobileData — WiFi must not strip NR (breaks VoNR/NR SA speeds)
+        return mIsPowerSaveMode || isDataDisabled || isNotDataSub;
     }
 
     private static void dlog(String msg) {
